@@ -1,0 +1,351 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function validUsername(username) {
+      return username is string
+        && username.size() >= 3
+        && username.size() <= 20
+        && username.matches('^[a-z0-9_]+$');
+    }
+
+    // Supports legacy 6-char and new 8-char CHEMM numbers
+    function validChemm(chemm) {
+      return chemm is string
+        && chemm.matches('^CHEMM-[0-9A-HJKMNP-TV-Z]{6,8}$');
+    }
+
+    function participantOfConversation(conversationId) {
+      return signedIn()
+        && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+    }
+
+    function participantOfCall(callId) {
+      return signedIn()
+        && (request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.callerId
+          || request.auth.uid == get(/databases/$(database)/documents/calls/$(callId)).data.calleeId);
+    }
+
+    function notBlocked(otherUid) {
+      return !exists(/databases/$(database)/documents/blocks/$(request.auth.uid)/users/$(otherUid))
+        && !exists(/databases/$(database)/documents/blocks/$(otherUid)/users/$(request.auth.uid));
+    }
+
+    function isGroupMember(groupId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+    }
+
+    function isGroupAdmin(groupId) {
+      return isGroupMember(groupId)
+        && get(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)).data.role in ['owner', 'admin'];
+    }
+
+    // Private account record — only the owner can read email / private prefs
+    match /users/{uid} {
+      allow read: if isSelf(uid);
+      allow create: if isSelf(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.email == request.auth.token.email
+        && validUsername(request.resource.data.username)
+        && request.resource.data.searchUsername == request.resource.data.username
+        && validChemm(request.resource.data.chemmNumber)
+        && !('roles' in request.resource.data)
+        && !('permissions' in request.resource.data)
+        && !('accountStatus' in request.resource.data
+            && !(request.resource.data.accountStatus in ['ACTIVE']));
+      allow update: if isSelf(uid)
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.chemmNumber == resource.data.chemmNumber
+        && request.resource.data.username == resource.data.username
+        && request.resource.data.searchUsername == resource.data.searchUsername
+        && request.resource.data.email == resource.data.email
+        && !('roles' in request.resource.data.diff(resource.data).affectedKeys())
+        && !('permissions' in request.resource.data.diff(resource.data).affectedKeys())
+        && !('accountStatus' in request.resource.data.diff(resource.data).affectedKeys())
+        && !('tags' in request.resource.data.diff(resource.data).affectedKeys());
+      allow delete: if false;
+    }
+
+    // Public discovery profile — no email
+    match /publicProfiles/{uid} {
+      allow read: if signedIn();
+      allow create, update: if isSelf(uid)
+        && request.resource.data.uid == uid
+        && validChemm(request.resource.data.chemmNumber)
+        && validUsername(request.resource.data.username)
+        && !('email' in request.resource.data)
+        && !('roles' in request.resource.data);
+      allow delete: if false;
+    }
+
+    match /usernames/{username} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && validUsername(username)
+        && request.resource.data.uid == request.auth.uid
+        && validChemm(request.resource.data.chemmNumber);
+      allow update, delete: if false;
+    }
+
+    match /chemmNumbers/{chemm} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && validChemm(chemm)
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.chemmNumber == chemm;
+      allow update, delete: if false;
+    }
+
+    match /publicKeys/{uid} {
+      allow read: if signedIn();
+      allow create, update: if isSelf(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.identityPk is string
+        && request.resource.data.fingerprint is string;
+      allow delete: if false;
+    }
+
+    match /devices/{uid}/items/{deviceId} {
+      allow read: if isSelf(uid);
+      allow create, update: if isSelf(uid)
+        && request.resource.data.uid == uid
+        && request.resource.data.deviceId == deviceId;
+      allow delete: if isSelf(uid);
+    }
+
+    match /contacts/{uid}/items/{contactUid} {
+      allow read: if isSelf(uid);
+      allow create, update: if isSelf(uid) && contactUid != uid;
+      allow delete: if isSelf(uid);
+    }
+
+    match /contactRequests/{requestId} {
+      allow read: if signedIn()
+        && (resource.data.fromUid == request.auth.uid
+          || resource.data.toUid == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.fromUid == request.auth.uid
+        && request.resource.data.toUid != request.auth.uid
+        && request.resource.data.status == 'pending'
+        && notBlocked(request.resource.data.toUid);
+      allow update: if signedIn()
+        && (
+          (resource.data.toUid == request.auth.uid
+            && request.resource.data.status in ['accepted', 'rejected'])
+          || (resource.data.fromUid == request.auth.uid
+            && request.resource.data.status == 'cancelled')
+        )
+        && request.resource.data.fromUid == resource.data.fromUid
+        && request.resource.data.toUid == resource.data.toUid;
+      allow delete: if false;
+    }
+
+    match /blocks/{uid}/users/{blockedUid} {
+      allow read: if isSelf(uid);
+      allow write: if isSelf(uid) && blockedUid != uid;
+    }
+
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.reporterUid == request.auth.uid
+        && request.resource.data.reportedUid != request.auth.uid
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() >= 3
+        && request.resource.data.reason.size() <= 500;
+      allow read, update, delete: if false;
+    }
+
+    match /privacySettings/{uid} {
+      allow read, write: if isSelf(uid);
+    }
+
+    match /conversations/{conversationId} {
+      allow read: if signedIn()
+        && request.auth.uid in resource.data.participants;
+
+      allow create: if signedIn()
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.participants.size() == 2
+        && request.resource.data.e2ee == true
+        && (!('type' in request.resource.data) || request.resource.data.type == 'direct')
+        && notBlocked(request.resource.data.participants[0] == request.auth.uid
+            ? request.resource.data.participants[1]
+            : request.resource.data.participants[0]);
+
+      allow update: if signedIn()
+        && request.auth.uid in resource.data.participants
+        && request.resource.data.participants == resource.data.participants
+        && request.resource.data.e2ee == true
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['lastMessage', 'updatedAt', 'unreadCount', 'typing', 'pinnedMessageIds']);
+
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if participantOfConversation(conversationId);
+
+        allow create: if participantOfConversation(conversationId)
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.ciphertext is string
+          && request.resource.data.ciphertext.size() > 0
+          && request.resource.data.ciphertext.size() <= 20000
+          && request.resource.data.nonce is string
+          && request.resource.data.clientMessageId is string
+          && request.resource.data.v is int
+          && !('text' in request.resource.data);
+
+        // Sender may soft-delete / edit ciphertext; others may only update reactions/status
+        allow update: if participantOfConversation(conversationId)
+          && request.resource.data.senderId == resource.data.senderId
+          && request.resource.data.clientMessageId == resource.data.clientMessageId
+          && (
+            (request.auth.uid == resource.data.senderId
+              && request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['ciphertext', 'nonce', 'v', 'status', 'reactions', 'editedAt', 'deletedFor', 'deletedForEveryone', 'replyTo']))
+            || (request.auth.uid != resource.data.senderId
+              && request.resource.data.ciphertext == resource.data.ciphertext
+              && request.resource.data.nonce == resource.data.nonce
+              && request.resource.data.diff(resource.data).affectedKeys()
+                  .hasOnly(['status', 'reactions', 'deletedFor']))
+          );
+
+        allow delete: if false;
+      }
+    }
+
+    // Group chats (metadata and messaging)
+    match /groups/{groupId} {
+      allow read: if signedIn() && (
+        isGroupMember(groupId) ||
+        ('memberUids' in resource.data && request.auth.uid in resource.data.memberUids)
+      );
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 64;
+      allow update: if signedIn() && (
+        isGroupAdmin(groupId) ||
+        isGroupMember(groupId) ||
+        ('memberUids' in resource.data && request.auth.uid in resource.data.memberUids) ||
+        ('memberUids' in request.resource.data && request.auth.uid in request.resource.data.memberUids)
+      );
+      allow delete: if false;
+
+      match /members/{memberUid} {
+        allow read: if signedIn() && (
+          isGroupMember(groupId) ||
+          ('memberUids' in get(/databases/$(database)/documents/groups/$(groupId)).data &&
+           request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberUids)
+        );
+        allow create: if signedIn() && (
+          isGroupAdmin(groupId) ||
+          memberUid == request.auth.uid ||
+          request.resource.data.role == 'owner' ||
+          (request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberUids)
+        ) && request.resource.data.uid == memberUid;
+        allow update: if isGroupAdmin(groupId) || isSelf(memberUid);
+        allow delete: if isGroupAdmin(groupId) || isSelf(memberUid);
+      }
+
+      match /messages/{messageId} {
+        allow read: if signedIn() && (
+          isGroupMember(groupId) ||
+          ('memberUids' in get(/databases/$(database)/documents/groups/$(groupId)).data &&
+           request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberUids)
+        );
+        allow create: if signedIn() && (
+          isGroupMember(groupId) ||
+          ('memberUids' in get(/databases/$(database)/documents/groups/$(groupId)).data &&
+           request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberUids)
+        ) && (
+          (request.resource.data.senderId == request.auth.uid) ||
+          (request.resource.data.senderId == 'system')
+        );
+        allow update: if signedIn() && (
+          isGroupMember(groupId) ||
+          ('memberUids' in get(/databases/$(database)/documents/groups/$(groupId)).data &&
+           request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.memberUids)
+        );
+        allow delete: if false;
+      }
+    }
+
+    match /groupInvitations/{invitationId} {
+      allow read: if signedIn() && (
+        resource.data.invitedUid == request.auth.uid ||
+        resource.data.invitedByUid == request.auth.uid ||
+        isGroupMember(resource.data.groupId)
+      );
+      allow create: if signedIn()
+        && request.resource.data.invitedByUid == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow update: if signedIn() && (
+        (resource.data.invitedUid == request.auth.uid && request.resource.data.status in ['accepted', 'declined']) ||
+        (resource.data.invitedByUid == request.auth.uid && request.resource.data.status == 'cancelled')
+      );
+      allow delete: if false;
+    }
+
+    match /calls/{callId} {
+      allow read: if signedIn()
+        && (request.auth.uid == resource.data.callerId
+          || request.auth.uid == resource.data.calleeId);
+
+      allow create: if signedIn()
+        && request.resource.data.callerId == request.auth.uid
+        && request.resource.data.calleeId is string
+        && request.resource.data.callerId != request.resource.data.calleeId
+        && notBlocked(request.resource.data.calleeId);
+
+      allow update: if signedIn()
+        && (request.auth.uid == resource.data.callerId
+          || request.auth.uid == resource.data.calleeId)
+        && request.resource.data.callerId == resource.data.callerId
+        && request.resource.data.calleeId == resource.data.calleeId;
+
+      allow delete: if false;
+
+      match /iceCandidates/{candidateId} {
+        allow read: if participantOfCall(callId);
+        allow create: if participantOfCall(callId)
+          && request.resource.data.from == request.auth.uid;
+        allow update: if false;
+        allow delete: if participantOfCall(callId);
+      }
+    }
+
+    match /callHistory/{uid}/items/{callId} {
+      allow read, write: if isSelf(uid);
+    }
+
+    // Admin roles — readable by the admin themselves; writes only via Admin SDK
+    match /adminRoles/{uid} {
+      allow read: if isSelf(uid);
+      allow write: if false;
+    }
+
+    match /auditLogs/{logId} {
+      allow read, write: if false;
+    }
+
+    match /systemConfig/{docId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    match /analyticsCounters/{docId} {
+      allow read: if false;
+      allow write: if false;
+    }
+  }
+}
